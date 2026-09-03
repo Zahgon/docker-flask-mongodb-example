@@ -3,15 +3,20 @@ import os
 import sys
 import io
 import json
+import shutil
 import imagehash
+import uvicorn
 
 from PIL import Image, ImageEnhance
-from flasgger import Swagger
-from flask import Flask, Response, request
+from fastapi import FastAPI, Request
+from fastapi.responses import Response
+from starlette.datastructures import UploadFile
+
+from http_compat import add_automatic_methods, install_error_pages
 
 
-app = Flask(__name__)
-swagger = Swagger(app)
+app = FastAPI()
+install_error_pages(app)
 storage_path = "/root/storage" if len(sys.argv) == 1 else sys.argv[1]
 
 
@@ -26,7 +31,7 @@ class FileHashSearch:
                 self.hashes[hash] = os.path.splitext(file)[0]
 
     def add(self, file, id) -> None:
-        self.hashes[imagehash.average_hash(Image.open(file.stream))] = id
+        self.hashes[imagehash.average_hash(Image.open(file.file))] = id
 
     def delete(self, id: int) -> None:
         self.hashes = {k: v for k, v in self.hashes.items() if v != str(id)}
@@ -54,41 +59,18 @@ file_hash_search = FileHashSearch()
 file_hash_search.load_from_path(storage_path)
 
 
-@app.route("/photo/<int:id>", methods=["GET"])
-def get_photo(id):
-    """Returns the photo by id
-    ---
-    parameters:
-      - name: id
-        in: path
-        type: string
-        required: true
-      - name: resize
-        description: Resize by width in pixels
-        in: query
-        type: integer
-        required: false
-      - name: rotate
-        description: Rotate left in degrees
-        in: query
-        type: integer
-        required: false
-      - name: brightness
-        in: query
-        type: float
-        required: false
-        maximum: 20
-    responses:
-      200:
-        description: The actual photo
-      404:
-        description: Photo not found
-    """
-    request_args = request.args
+# ``{id:int}`` is Starlette's equivalent of Flask's ``<int:id>``: it matches
+# digits only, so ``/photo/similar`` never binds here.  A bare ``{id}`` matches
+# any segment, which let this route shadow the literal ``/photo/similar`` rule
+# and made declaration order load-bearing.
+@app.get("/photo/{id:int}")
+async def get_photo(id: int, request: Request):
+    """Returns the photo by id"""
+    request_args = request.query_params
     resize = int(request_args.get("resize")) if "resize" in request_args else 0
-    rotate = int(request.args.get("rotate")) if "rotate" in request_args else 0
+    rotate = int(request_args.get("rotate")) if "rotate" in request_args else 0
     brightness = (
-        float(request.args.get("brightness")) if "brightness" in request_args else 0
+        float(request_args.get("brightness")) if "brightness" in request_args else 0
     )
     if brightness > 20:
         return get_response({"error": "Maximum value for brightness is 20"}, 500)
@@ -109,81 +91,42 @@ def get_photo(id):
     img.save(output, format="JPEG")
     image_data = output.getvalue()
     output.close()
-    return Response(image_data, status=200, mimetype="image/jpeg")
+    return Response(image_data, status_code=200, media_type="image/jpeg")
 
 
-@app.route("/photo/similar", methods=["PUT"])
-def get_photos_like_this():
-    """Find similar photos:
-    ---
-    parameters:
-      - name: file
-        required: false
-        in: formData
-        type: file
-      - name: similarity
-        description: How similar the file should be, minimum 0 maximum 40
-        in: query
-        type: integer
-        required: false
-        maximum: 40
-    definitions:
-      Number:
-        type: integer
-    responses:
-      200:
-        description: Found
-        schema:
-          $ref: '#/definitions/Number'
-          type: array
-      404:
-        description: Erros occured
-    """
-    if "file" not in request.files:
+@app.put("/photo/similar")
+async def get_photos_like_this(request: Request):
+    """Find similar photos"""
+    file = (await request.form()).get("file")
+    if not isinstance(file, UploadFile):
         return get_response({"error": "File parameter not present!"}, 500)
-    file = request.files["file"]
-    if file.mimetype != "image/jpeg":
+    if file.content_type != "image/jpeg":
         return get_response({"error": "File mimetype must pe jpeg!"}, 500)
 
-    request_args = request.args
+    request_args = request.query_params
     similarity = (
-        int(request.args.get("similarity")) if "similarity" in request_args else 10
+        int(request_args.get("similarity")) if "similarity" in request_args else 10
     )
     result = file_hash_search.get_similar(
-        imagehash.average_hash(Image.open(file.stream)), similarity
+        imagehash.average_hash(Image.open(file.file)), similarity
     )
 
-    return Response(json.dumps(result), status=200, mimetype="application/json")
+    return Response(json.dumps(result), status_code=200, media_type="application/json")
 
 
-@app.route("/photo/<int:id>", methods=["PUT"])
-def set_photo(id):
-    """Add jpeg photo on disk:
-    ---
-    parameters:
-      - name: id
-        in: path
-        type: string
-        required: true
-      - name: file
-        required: false
-        in: formData
-        type: file
-    responses:
-      200:
-        description: Added succesfully
-      404:
-        description: Error saving photo
-    """
-    if "file" not in request.files:
+@app.put("/photo/{id:int}")
+async def set_photo(id: int, request: Request):
+    """Add jpeg photo on disk"""
+    file = (await request.form()).get("file")
+    if not isinstance(file, UploadFile):
         return get_response({"error": "File parameter not present!"}, 500)
 
-    file = request.files["file"]
-    if file.mimetype != "image/jpeg":
+    if file.content_type != "image/jpeg":
         return get_response({"error": "File mimetype must pe jpeg!"}, 500)
 
     try:
-        file.save(get_photo_path(id))
+        with open(get_photo_path(id), "wb") as destination:
+            shutil.copyfileobj(file.file, destination)
     except Exception as e:
         return get_response({"error": "Could not save file to disk!"}, 500)
 
@@ -191,21 +134,9 @@ def set_photo(id):
     return get_response({"status": "success"}, 200)
 
 
-@app.route("/photo/<int:id>", methods=["DELETE"])
-def delete_photo(id):
-    """Delete photo by id:
-    ---
-    parameters:
-      - name: id
-        in: path
-        type: string
-        required: true
-    responses:
-      200:
-        description: Deleted succesfully
-      404:
-        description: Error deleting
-    """
+@app.delete("/photo/{id:int}")
+async def delete_photo(id: int):
+    """Delete photo by id"""
     try:
         os.remove(get_photo_path(id))
         file_hash_search.delete(id)
@@ -218,11 +149,16 @@ def delete_photo(id):
 def get_response(data: dict, status: int) -> Response:
     return Response(
         json.dumps(data),
-        status=status,
-        mimetype="application/json",
+        status_code=status,
+        media_type="application/json",
     )
+
+
+# Werkzeug served HEAD and OPTIONS on every rule automatically; restore that
+# now that all the routes above are registered.
+add_automatic_methods(app)
 
 
 if __name__ == "__main__":
     # starts the app in debug mode, bind on all ip's and on port 5000
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    uvicorn.run(app, host="0.0.0.0", port=5000)

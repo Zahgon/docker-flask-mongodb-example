@@ -1,17 +1,19 @@
 import json
 
 import redis
+import uvicorn
 from datetime import datetime
-from flask import Flask, request, Response
+from fastapi import FastAPI, Request
+from fastapi.responses import Response
 from pymongo import MongoClient, errors
 from bson import json_util
-from flasgger import Swagger
 from utils import read_docker_secret
 from caching import cache, cache_invalidate
+from http_compat import add_automatic_methods, install_error_pages
 
 
-app = Flask(__name__)
-swagger = Swagger(app)
+app = FastAPI()
+install_error_pages(app)
 users = MongoClient("mongodb", 27017).demo.users
 
 
@@ -38,41 +40,16 @@ def format_user(user: dict) -> dict:
     }
 
 
-@app.route("/users/<int:userid>", methods=["POST"])
+@app.post("/users/{userid:int}")
 @cache_invalidate(redis=redis_cache, key="userid")
-def add_user(userid: int):
-    """Create user
-    ---
-    parameters:
-      - name: userid
-        in: path
-        type: string
-        required: true
-      - name: email
-        in: formData
-        type: string
-        required: true
-      - name: name
-        in: formData
-        type: string
-        required: true
-      - name: birthdate
-        in: formData
-        type: string
-      - name: country
-        in: formData
-        type: string
-        required: false
-    responses:
-      200:
-        description: Creation succeded
-    """
-    request_params = request.form
+async def add_user(userid: int, request: Request):
+    """Create user"""
+    request_params = await request.form()
     if "email" not in request_params or "name" not in request_params:
         return Response(
             "Email and name not present in parameters!",
-            status=404,
-            mimetype="application/json",
+            status_code=404,
+            media_type="application/json",
         )
     try:
         users.insert_one(
@@ -87,44 +64,21 @@ def add_user(userid: int):
             }
         )
     except errors.DuplicateKeyError as e:
-        return Response("Duplicate user id!", status=404, mimetype="application/json")
+        return Response(
+            "Duplicate user id!", status_code=404, media_type="application/json"
+        )
     return Response(
         json.dumps(format_user(users.find_one({"_id": userid}))),
-        status=200,
-        mimetype="application/json",
+        status_code=200,
+        media_type="application/json",
     )
 
 
-@app.route("/users/<int:userid>", methods=["PUT"])
+@app.put("/users/{userid:int}")
 @cache_invalidate(redis=redis_cache, key="userid")
-def update_user(userid: int):
-    """Update user information
-    ---
-    parameters:
-      - name: userid
-        in: path
-        type: string
-        required: true
-      - name: email
-        in: formData
-        type: string
-        required: false
-      - name: name
-        in: formData
-        type: string
-        required: false
-      - name: birthdate
-        in: formData
-        type: string
-      - name: country
-        in: formData
-        type: string
-        required: false
-    responses:
-      200:
-        description: Update succeded
-    """
-    request_params = request.form
+async def update_user(userid: int, request: Request):
+    """Update user information"""
+    request_params = await request.form()
     set = {}
     if "email" in request_params:
         set["email"] = request_params["email"]
@@ -138,118 +92,54 @@ def update_user(userid: int):
     users.update_one({"_id": userid}, {"$set": set})
     return Response(
         json.dumps(format_user(users.find_one({"_id": userid}))),
-        status=200,
-        mimetype="application/json",
+        status_code=200,
+        media_type="application/json",
     )
 
 
-@app.route("/users/<int:userid>", methods=["GET"])
+@app.get("/users/{userid:int}")
 @cache(redis=redis_cache, key="userid")
-def get_user(userid: int):
-    """Details about a user
-    ---
-    parameters:
-      - name: userid
-        in: path
-        type: string
-        required: true
-    definitions:
-      User:
-        type: object
-        properties:
-          _id:
-            type: integer
-          email:
-            type: string
-          name:
-            type: string
-          birthdate:
-            type: string
-          country:
-            type: string
-    responses:
-      200:
-        description: User model
-        schema:
-          $ref: '#/definitions/User'
-      404:
-        description: User not found
-    """
+async def get_user(userid: int):
+    """Details about a user"""
     user = users.find_one({"_id": userid})
 
     if None == user:
-        return Response("", status=404, mimetype="application/json")
+        return Response("", status_code=404, media_type="application/json")
     return Response(
-        json.dumps(format_user(user)), status=200, mimetype="application/json"
+        json.dumps(format_user(user)), status_code=200, media_type="application/json"
     )
 
 
-@app.route("/users", methods=["GET"])
-def get_users():
-    """Example endpoint returning all users with pagination
-    ---
-    parameters:
-      - name: limit
-        in: query
-        type: integer
-        required: false
-      - name: offset
-        in: query
-        type: integer
-        required: false
-    definitions:
-      Users:
-        type: array
-        items:
-            properties:
-              _id:
-                type: integer
-              email:
-                type: string
-              name:
-                type: string
-              birthdate:
-                type: string
-              country:
-                type: string
-    responses:
-      200:
-        description: List of user models
-        schema:
-          $ref: '#/definitions/Users'
-    """
-    request_args = request.args
+@app.get("/users")
+async def get_users(request: Request):
+    """Example endpoint returning all users with pagination"""
+    request_args = request.query_params
     limit = int(request_args.get("limit")) if "limit" in request_args else 10
     offset = int(request_args.get("offset")) if "offset" in request_args else 0
     user_list = users.find().limit(limit).skip(offset)
     if None == users:
-        return Response(json.dumps([]), status=200, mimetype="application/json")
+        return Response(json.dumps([]), status_code=200, media_type="application/json")
     extracted = [format_user(d) for d in user_list]
 
     return Response(
         json.dumps(extracted, default=json_util.default),
-        status=200,
-        mimetype="application/json",
+        status_code=200,
+        media_type="application/json",
     )
 
 
-@app.route("/users/<int:userid>", methods=["DELETE"])
+@app.delete("/users/{userid:int}")
 @cache_invalidate(redis=redis_cache, key="userid")
-def delete_user(userid: int):
-    """Delete operation for a user
-    ---
-    parameters:
-      - name: userid
-        in: path
-        type: string
-        required: true
-    responses:
-      200:
-        description: User deleted
-    """
+async def delete_user(userid: int):
+    """Delete operation for a user"""
     users.delete_one({"_id": userid})
-    return Response("", status=200, mimetype="application/json")
+    return Response("", status_code=200, media_type="application/json")
+
+
+# Werkzeug served HEAD and OPTIONS on every rule automatically; restore that
+# now that all the routes above are registered.
+add_automatic_methods(app)
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    uvicorn.run(app, host="0.0.0.0", port=5000)

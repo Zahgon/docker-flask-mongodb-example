@@ -1,13 +1,87 @@
-from flask import Flask, render_template, session, redirect, url_for
-from flask_session import Session
+import os
+import pickle
+import uuid
 from tempfile import mkdtemp
 
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.responses import Response
+from fastapi.templating import Jinja2Templates
 
-app = Flask(__name__, template_folder="template")
-app.config["SESSION_FILE_DIR"] = mkdtemp()
-app.config["SESSION_PERMANENT"] = False
-app.config["SESSION_TYPE"] = "filesystem"
-Session(app)
+from http_compat import add_automatic_methods, install_error_pages
+
+
+app = FastAPI()
+install_error_pages(app)
+SESSION_FILE_DIR = mkdtemp()
+SESSION_PERMANENT = False
+SESSION_TYPE = "filesystem"
+SESSION_COOKIE_NAME = "session"
+
+templates = Jinja2Templates(
+    directory=os.path.join(os.path.dirname(os.path.abspath(__file__)), "template")
+)
+templates.env.globals["url_for"] = lambda name, **params: app.url_path_for(
+    name, **params
+)
+
+REDIRECT_BODY = (
+    "<!doctype html>\n"
+    "<html lang=en>\n"
+    "<title>Redirecting...</title>\n"
+    "<h1>Redirecting...</h1>\n"
+    "<p>You should be redirected automatically to the target URL: "
+    '<a href="{location}">{location}</a>. If not, click the link.\n'
+)
+
+
+def session_path(session_id: str) -> str:
+    return os.path.join(SESSION_FILE_DIR, session_id)
+
+
+def load_session(session_id: str) -> dict:
+    try:
+        with open(session_path(session_id), "rb") as stored:
+            return pickle.load(stored)
+    except (OSError, EOFError, pickle.UnpicklingError):
+        return {}
+
+
+def store_session(session_id: str, session: dict) -> None:
+    with open(session_path(session_id), "wb") as stored:
+        pickle.dump(session, stored)
+
+
+@app.middleware("http")
+async def session_middleware(request: Request, call_next):
+    session_id = request.cookies.get(SESSION_COOKIE_NAME)
+    if session_id is None:
+        session_id = str(uuid.uuid4())
+        session = {}
+    else:
+        session = load_session(session_id)
+    request.state.session = session
+    response = await call_next(request)
+    store_session(session_id, request.state.session)
+    response.headers.append(
+        "set-cookie", "%s=%s; HttpOnly; Path=/" % (SESSION_COOKIE_NAME, session_id)
+    )
+    return response
+
+
+def redirect(request: Request, location: str) -> Response:
+    """Redirect to *location* as Werkzeug does: a relative Location header.
+
+    Building an absolute URL from ``request.base_url`` would advertise the
+    host the service happens to be reached on, which behind the gateway is the
+    internal one.
+    """
+    return Response(
+        REDIRECT_BODY.format(location=location),
+        status_code=302,
+        media_type="text/html",
+        headers={"Location": location},
+    )
 
 
 class Game:
@@ -43,8 +117,9 @@ def initiate_session(session):
     session["draw"] = False
 
 
-@app.route("/")
-def index():
+@app.get("/")
+def index(request: Request):
+    session = request.state.session
     if "board" not in session:
         initiate_session(session)
     winner_x = game.has_won(session["board"], "X")
@@ -54,28 +129,37 @@ def index():
         session["turn"] = "X" if winner_x else "O"
     if game.has_moves_left(session["board"]):
         session["draw"] = True
-    return render_template(
+    return templates.TemplateResponse(
         "tictactoe.html",
-        game=session["board"],
-        turn=session["turn"],
-        winnerFound=session["winner"],
-        winner=session["turn"],
-        draw=session["draw"],
+        {
+            "request": request,
+            "game": session["board"],
+            "turn": session["turn"],
+            "winnerFound": session["winner"],
+            "winner": session["turn"],
+            "draw": session["draw"],
+        },
     )
 
 
-@app.route("/play/<int:row>/<int:col>")
-def play(row: int, col: int):
+@app.get("/play/{row:int}/{col:int}")
+def play(request: Request, row: int, col: int):
+    session = request.state.session
     session["board"][col * 3 + row] = session["turn"]
     session["turn"] = game.get_next_player(session["turn"])
-    return redirect(url_for("index"))
+    return redirect(request, app.url_path_for("index"))
 
 
-@app.route("/reset")
-def reset():
-    initiate_session(session)
-    return redirect(url_for("index"))
+@app.get("/reset")
+def reset(request: Request):
+    initiate_session(request.state.session)
+    return redirect(request, app.url_path_for("index"))
+
+
+# Werkzeug served HEAD and OPTIONS on every rule automatically; restore that
+# now that all the routes above are registered.
+add_automatic_methods(app)
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    uvicorn.run(app, host="0.0.0.0", port=5000)

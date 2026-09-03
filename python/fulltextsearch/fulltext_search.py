@@ -1,59 +1,65 @@
 import sys
 import json, datetime
+from typing import Optional
 
-from flask import Flask, request, Response
-from flask_httpauth import HTTPBasicAuth
-from werkzeug import generate_password_hash, check_password_hash
-from flasgger import Swagger
+import uvicorn
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import Response
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from werkzeug.security import generate_password_hash, check_password_hash
 from pymongo import MongoClient, TEXT
 from bson import json_util
 
+from http_compat import add_automatic_methods, install_error_pages
 
-app = Flask(__name__)
-auth = HTTPBasicAuth()
-swagger_template = {"securityDefinitions": {"basicAuth": {"type": "basic"}}}
+
+app = FastAPI()
+install_error_pages(app)
+basic_auth = HTTPBasic(auto_error=False)
 users = {
     "admin": generate_password_hash("changeme"),
 }
 
 
-@auth.verify_password
+class UnauthorizedAccess(Exception):
+    pass
+
+
+@app.exception_handler(UnauthorizedAccess)
+async def unauthorized_access(request: Request, exc: UnauthorizedAccess) -> Response:
+    return Response(
+        "Unauthorized Access",
+        status_code=401,
+        media_type="text/html",
+        headers={"WWW-Authenticate": 'Basic realm="Authentication Required"'},
+    )
+
+
 def verify_password(username, password):
     if username in users and check_password_hash(users.get(username), password):
         return username
 
 
-swagger = Swagger(app, template=swagger_template)
+def login_required(
+    credentials: Optional[HTTPBasicCredentials] = Depends(basic_auth),
+) -> str:
+    if credentials is None:
+        raise UnauthorizedAccess()
+    username = verify_password(credentials.username, credentials.password)
+    if not username:
+        raise UnauthorizedAccess()
+    return username
+
+
 mongo_host = "mongodb"
 if len(sys.argv) == 2:
     mongo_host = sys.argv[1]
 fulltext_search = MongoClient(mongo_host, 27017).demo.fulltext_search
 
 
-@app.route("/search/<string:searched_expression>")
-@auth.login_required
-def search(searched_expression: str):
-    """Search by an expression
-    ---
-    parameters:
-      - name: searched_expression
-        in: path
-        type: string
-        required: true
-    definitions:
-      Result:
-        type: object
-        properties:
-          app_text:
-            type: string
-          indexed_date:
-            type: date
-    responses:
-      200:
-        description: List of results
-        schema:
-          $ref: '#/definitions/Result'
-    """
+@app.get("/search/{searched_expression}")
+async def search(searched_expression: str, username: str = Depends(login_required)):
+    """Search by an expression"""
     results = (
         fulltext_search.find(
             {"$text": {"$search": searched_expression}},
@@ -68,31 +74,20 @@ def search(searched_expression: str):
     ]
     return Response(
         json.dumps(list(results), default=json_util.default),
-        status=200,
-        mimetype="application/json",
+        status_code=200,
+        media_type="application/json",
     )
 
 
-@app.route("/fulltext", methods=["PUT"])
-@auth.login_required
-def add_expression():
-    """Add an expression to fulltext index
-    ---
-    parameters:
-      - name: expression
-        in: formData
-        type: string
-        required: true
-    responses:
-      200:
-        description: Creation succeded
-    """
-    request_params = request.form
+@app.put("/fulltext")
+async def add_expression(request: Request, username: str = Depends(login_required)):
+    """Add an expression to fulltext index"""
+    request_params = await request.form()
     if "expression" not in request_params:
         return Response(
             '"Expression" must be present as a POST parameter!',
-            status=404,
-            mimetype="application/json",
+            status_code=404,
+            media_type="application/json",
         )
     document = {
         "app_text": request_params["expression"],
@@ -101,9 +96,14 @@ def add_expression():
     fulltext_search.save(document)
     return Response(
         json.dumps(document, default=json_util.default),
-        status=200,
-        mimetype="application/json",
+        status_code=200,
+        media_type="application/json",
     )
+
+
+# Werkzeug served HEAD and OPTIONS on every rule automatically; restore that
+# now that all the routes above are registered.
+add_automatic_methods(app)
 
 
 if __name__ == "__main__":
@@ -112,4 +112,4 @@ if __name__ == "__main__":
         [("app_text", TEXT)], name="fulltextsearch_index", default_language="english"
     )
     # starts the app in debug mode, bind on all ip's and on port 5000
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    uvicorn.run(app, host="0.0.0.0", port=5000)

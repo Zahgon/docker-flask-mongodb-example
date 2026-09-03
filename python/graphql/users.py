@@ -1,3 +1,4 @@
+import json
 import sys
 
 from pydantic import BaseModel, Field
@@ -13,13 +14,63 @@ from ariadne import (
 from ariadne.constants import PLAYGROUND_HTML
 from ariadne import ScalarType
 from pymongo import MongoClient
-from flask import request, jsonify
-from flask import Flask
-from flask_cors import CORS
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from starlette.datastructures import MutableHeaders
+import uvicorn
+
+from http_compat import JsonBodyError, add_automatic_methods, html_error, install_error_pages, read_json
 
 
-app = Flask(__name__)
-CORS(app)
+# Ariadne's ``debug`` flag decides whether a resolver error carries an
+# ``extensions.exception`` payload, and the original ran under
+# ``app.run(debug=True)``.  Starlette's own ``debug`` flag is deliberately not
+# set: it would put a Python traceback in the body of an unhandled error, which
+# the Flask original never did.
+GRAPHQL_DEBUG = True
+
+class AllowAnyOrigin:
+    """``flask_cors.CORS(app)`` tagged every response, not just the ones that
+    carried an ``Origin``; Starlette's CORSMiddleware only decorates requests
+    that do, so the header is restored here for the rest.
+
+    Written as raw ASGI rather than ``BaseHTTPMiddleware`` because the latter
+    re-emits the response as a stream, which costs it its ``Content-Length``.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_origin(message) -> None:
+            if message["type"] == "http.response.start":
+                MutableHeaders(scope=message).setdefault(
+                    "access-control-allow-origin", "*"
+                )
+            await send(message)
+
+        await self.app(scope, receive, send_with_origin)
+
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.add_middleware(AllowAnyOrigin)
+install_error_pages(app)
+
+
+@app.exception_handler(JsonBodyError)
+async def json_body_error(request: Request, exc: JsonBodyError) -> Response:
+    return html_error(exc.status_code, exc.description)
 mongo_host = "mongodb"
 if len(sys.argv) == 2:
     mongo_host = sys.argv[1]
@@ -131,18 +182,30 @@ schema = make_executable_schema(
 )
 
 
-@app.route("/graphql", methods=["GET"])
-def graphql_playground():
-    return PLAYGROUND_HTML, 200
+def jsonify(payload, status_code: int = 200) -> Response:
+    body = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    return Response(body, status_code=status_code, media_type="application/json")
 
 
-@app.route("/graphql", methods=["POST"])
-def graphql_server():
-    data = request.get_json()
-    success, result = graphql_sync(schema, data, context_value=request, debug=app.debug)
+@app.get("/graphql")
+async def graphql_playground():
+    return Response(PLAYGROUND_HTML, status_code=200, media_type="text/html")
+
+
+@app.post("/graphql")
+async def graphql_server(request: Request):
+    data = await read_json(request)
+    success, result = graphql_sync(
+        schema, data, context_value=request, debug=GRAPHQL_DEBUG
+    )
     status_code = 200 if success else 400
-    return jsonify(result), status_code
+    return jsonify(result, status_code)
+
+
+# Werkzeug served HEAD and OPTIONS on every rule automatically; restore that
+# now that all the routes above are registered.
+add_automatic_methods(app)
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    uvicorn.run(app, host="0.0.0.0", port=5000)

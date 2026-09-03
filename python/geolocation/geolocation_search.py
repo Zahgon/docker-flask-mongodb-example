@@ -1,52 +1,26 @@
-import json, sys
+import json, sys, uuid, datetime
 
-from flask import Flask, request, Response, jsonify
-from flask_jwt_extended import create_access_token
-from flask_jwt_extended import jwt_required
-from flask_jwt_extended import JWTManager
-from flasgger import Swagger
+import jwt as pyjwt
+import uvicorn
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import Response
 from pymongo import MongoClient, GEOSPHERE
 from bson import json_util
-from flask_restful import Api
+
+from http_compat import add_automatic_methods, install_error_pages
 
 
-app = Flask(__name__)
+app = FastAPI()
+install_error_pages(app)
 mongo_host = "mongodb"
 if len(sys.argv) == 2:
     mongo_host = sys.argv[1]
 places = MongoClient(mongo_host, 27017).demo.places
 
-app.config["JWT_AUTH_URL_RULE"] = "/api/auth"
-app.config["JWT_SECRET_KEY"] = "super-secret"
-
-template = {
-    "swagger": "2.0",
-    "info": {
-        "title": "Geolocation search demo",
-        "description": "A demo of geolocation search using mongodb and flask",
-    },
-    "securityDefinitions": {
-        "Bearer": {
-            "type": "apiKey",
-            "name": "Authorization",
-            "in": "header",
-            "description": 'JWT Authorization header using the Bearer scheme. Example: "Authorization: Bearer {token}"',
-        }
-    },
-    "security": [
-        {
-            "Bearer": [],
-        }
-    ],
-}
-
-app.config["SWAGGER"] = {
-    "title": "Geolocation search demo",
-    "uiversion": 3,
-    "specs_route": "/apidocs/",
-}
-swagger = Swagger(app, template=template)
-api = Api(app)
+JWT_AUTH_URL_RULE = "/api/auth"
+JWT_SECRET_KEY = "super-secret"
+JWT_ALGORITHM = "HS256"
+JWT_ACCESS_TOKEN_EXPIRES = datetime.timedelta(minutes=15)
 
 
 class User(object):
@@ -63,72 +37,99 @@ users = [
     User(1, "admin", "secret"),
 ]
 
-jwt = JWTManager(app)
+
+class NoAuthorizationError(Exception):
+    def __init__(self, message):
+        self.message = message
 
 
-@app.route("/login", methods=["POST"])
-def login():
-    """
-    User authenticate method.
-    ---
-    description: Authenticate user with supplied credentials.
-    parameters:
-      - name: username
-        in: formData
-        type: string
-        required: true
-      - name: password
-        in: formData
-        type: string
-        required: true
-    responses:
-      200:
-        description: User successfully logged in.
-      400:
-        description: User login failed.
-    """
+class InvalidTokenError(Exception):
+    def __init__(self, message):
+        self.message = message
+
+
+def jsonify(payload, status_code: int = 200) -> Response:
+    return Response(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        status_code=status_code,
+        media_type="application/json",
+    )
+
+
+@app.exception_handler(NoAuthorizationError)
+async def no_authorization(request: Request, exc: NoAuthorizationError) -> Response:
+    return jsonify({"msg": exc.message}, 401)
+
+
+@app.exception_handler(InvalidTokenError)
+async def invalid_token(request: Request, exc: InvalidTokenError) -> Response:
+    return jsonify({"msg": exc.message}, 422)
+
+
+def create_access_token(identity):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return pyjwt.encode(
+        {
+            "fresh": False,
+            "iat": now,
+            "jti": str(uuid.uuid4()),
+            "type": "access",
+            "sub": identity,
+            "nbf": now,
+            "exp": now + JWT_ACCESS_TOKEN_EXPIRES,
+        },
+        JWT_SECRET_KEY,
+        algorithm=JWT_ALGORITHM,
+    )
+
+
+def jwt_required(request: Request) -> str:
+    auth_header = request.headers.get("Authorization", None)
+    if not auth_header:
+        raise NoAuthorizationError("Missing Authorization Header")
+    parts = auth_header.split()
+    if parts[0] != "Bearer":
+        raise NoAuthorizationError(
+            "Missing 'Bearer' type in 'Authorization' header. "
+            "Expected 'Authorization: Bearer <JWT>'"
+        )
+    if len(parts) != 2:
+        raise NoAuthorizationError(
+            "Bad Authorization header. Expected 'Authorization: Bearer <JWT>'"
+        )
     try:
-        username = request.form.get("username", None)
-        password = request.form.get("password", None)
+        decoded = pyjwt.decode(parts[1], JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+    except pyjwt.PyJWTError as e:
+        raise InvalidTokenError(str(e))
+    return decoded["sub"]
+
+
+@app.post("/login")
+async def login(request: Request):
+    """User authenticate method."""
+    try:
+        request_params = await request.form()
+        username = request_params.get("username", None)
+        password = request_params.get("password", None)
         authenticated_user = [
             user
             for user in users
             if username == user.username and password == user.password
         ]
         if not authenticated_user:
-            return jsonify({"msg": "Bad username or password"}), 401
+            return jsonify({"msg": "Bad username or password"}, 401)
 
         access_token = create_access_token(identity=username)
-        resp = jsonify(access_token="Bearer {0}".format(access_token))
+        resp = jsonify({"access_token": "Bearer {0}".format(access_token)})
     except Exception as e:
-        resp = jsonify({"message": "Bad username and/or password"})
-        resp.status_code = 401
+        resp = jsonify({"message": "Bad username and/or password"}, 401)
     return resp
 
 
-@app.route("/location", methods=["POST"])
-@jwt_required()
-def new_location():
-    """Add a place (name, latitude and longitude)
-    ---
-    parameters:
-      - name: name
-        in: formData
-        type: string
-        required: true
-      - name: lat
-        in: formData
-        type: string
-        required: true
-      - name: lng
-        in: formData
-        type: string
-        required: true
-    responses:
-      200:
-        description: Place added
-    """
-    request_params = request.form
+@app.post("/location")
+async def new_location(request: Request, identity: str = Depends(jwt_required)):
+    """Add a place (name, latitude and longitude)"""
+    request_params = await request.form()
     if (
         "name" not in request_params
         or "lat" not in request_params
@@ -136,8 +137,8 @@ def new_location():
     ):
         return Response(
             "Name, lat, lng must be present in parameters!",
-            status=404,
-            mimetype="application/json",
+            status_code=404,
+            media_type="application/json",
         )
     latitude = float(request_params["lng"])
     longitude = float(request_params["lat"])
@@ -149,52 +150,18 @@ def new_location():
     )
     return Response(
         json.dumps({"name": request_params["name"], "lat": latitude, "lng": longitude}),
-        status=200,
-        mimetype="application/json",
+        status_code=200,
+        media_type="application/json",
     )
 
 
-@app.route("/location/<string:lat>/<string:lng>")
-@jwt_required()
-def get_near(lat: str, lng: str):
-    """Get all points near a location given coordonates, and radius
-    ---
-    parameters:
-      - name: lat
-        in: path
-        type: string
-        required: true
-      - name: lng
-        in: path
-        type: string
-        required: true
-      - name: max_distance
-        in: query
-        type: integer
-        required: false
-      - name: limit
-        in: query
-        type: integer
-        required: false
-    definitions:
-      Place:
-        type: object
-        properties:
-          name:
-            type: string
-          lat:
-            type: double
-          long:
-            type: double
-    responses:
-      200:
-        description: Places list
-        schema:
-          $ref: '#/definitions/Place'
-          type: array
-    """
-    max_distance = int(request.args.get("max_distance", 10000))
-    limit = int(request.args.get("limit", 10))
+@app.get("/location/{lat}/{lng}")
+async def get_near(
+    lat: str, lng: str, request: Request, identity: str = Depends(jwt_required)
+):
+    """Get all points near a location given coordonates, and radius"""
+    max_distance = int(request.query_params.get("max_distance", 10000))
+    limit = int(request.query_params.get("limit", 10))
     cursor = places.find(
         {
             "location": {
@@ -218,9 +185,14 @@ def get_near(lat: str, lng: str):
     ]
     return Response(
         json.dumps(extracted, default=json_util.default),
-        status=200,
-        mimetype="application/json",
+        status_code=200,
+        media_type="application/json",
     )
+
+
+# Werkzeug served HEAD and OPTIONS on every rule automatically; restore that
+# now that all the routes above are registered.
+add_automatic_methods(app)
 
 
 if __name__ == "__main__":
@@ -229,4 +201,4 @@ if __name__ == "__main__":
     places.create_index([("location", GEOSPHERE)], name="location_index")
 
     # starts the app in debug mode, bind on all ip's and on port 5000
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    uvicorn.run(app, host="0.0.0.0", port=5000)

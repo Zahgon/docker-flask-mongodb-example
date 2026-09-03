@@ -14,7 +14,7 @@ def cache(redis: redis.Redis, key: str):
 
     def decorator(fn):  # define a decorator for a function "fn"
         @wraps(fn)
-        def wrapped(
+        async def wrapped(
             *args, **kwargs
         ):  # define a wrapper that will finally call "fn" with all arguments
             # if cache exists -> load it and return its content
@@ -22,7 +22,7 @@ def cache(redis: redis.Redis, key: str):
             if cached:
                 return pickle.loads(cached)
             # execute the function with all arguments passed
-            res = fn(*args, **kwargs)
+            res = await fn(*args, **kwargs)
             # save cache in redis
             redis.set(kwargs[key], pickle.dumps(res))
             return res
@@ -43,11 +43,11 @@ def cache_invalidate(redis: redis.Redis, key: str):
 
     def decorator(fn):  # define a decorator for a function "fn"
         @wraps(fn)
-        def wrapped_f(
+        async def wrapped_f(
             *args, **kwargs
         ):  # define a wrapper that will finally call "fn" with all arguments
             # execute the function with all arguments passed
-            res = fn(*args, **kwargs)
+            res = await fn(*args, **kwargs)
             # delete cache
             redis.delete(kwargs[key])
             return res
